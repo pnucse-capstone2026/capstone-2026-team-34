@@ -1,0 +1,80 @@
+'use client';
+
+import Link from 'next/link';
+import { useEffect, useState } from 'react';
+import { redirectToKakao } from '@/entities/session/api/auth-api';
+import { InlineNotice } from '@/shared/ui/app-frame';
+import { Button } from '@/shared/ui';
+
+/**
+ * 랜딩 CTA. 예전 primary 였던 "임시 세션으로 둘러보기"는 없앴다 — 그 버튼은 인증 없이
+ * **모든 방문자가 공유하는 계정 하나**로 로그인시켜, 서로의 여행·사진·위치가 그대로 보였다.
+ * 이제 실제 계정을 만드는 경로(이메일 가입 / 카카오)만 남기고 가입을 primary 로 올린다.
+ */
+export function AuthStartActions() {
+  const [loading, setLoading] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  // 카카오 로그인은 앱에서 인앱 브라우저(Custom Tabs)로 열린다 — 사용자가 거기서 X 를 눌러
+  // 취소하고 돌아오면 이 화면은 그대로 살아 있어 버튼이 "확인 중" 에 멈춘 채로 남는다.
+  // 성공하면 콜백 URL 로 이동해 이 화면 자체가 사라지므로, 되돌아온 경우만 여기서 푼다.
+  useEffect(() => {
+    if (!loading) return;
+    const handleVisible = () => {
+      if (document.visibilityState === 'visible') setLoading(false);
+    };
+    document.addEventListener('visibilitychange', handleVisible);
+    return () => document.removeEventListener('visibilitychange', handleVisible);
+  }, [loading]);
+
+  async function handleKakaoStart() {
+    setLoading(true);
+    setNotice(null);
+    try {
+      // 설정 확인 + 시작 URL 조회를 redirectToKakao 가 함께 처리한다(성공 시 페이지가 떠난다).
+      await redirectToKakao();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '로그인을 시작하지 못했습니다.');
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="space-y-3">
+      <Link
+        href="/signup"
+        className="wvr-shine flex h-14 w-full items-center justify-center gap-2 rounded-[16px] bg-[color:var(--btn-bg)] text-[16px] font-bold text-[color:var(--btn-text)] shadow-[var(--shadow-btn)] transition-colors hover:bg-[color:var(--btn-bg-press)]"
+      >
+        이메일로 시작하기
+        <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+          <path
+            d="M4 10h11M10.5 5.5 15 10l-4.5 4.5"
+            stroke="currentColor"
+            strokeWidth="1.8"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        </svg>
+      </Link>
+
+      <div className="flex items-center gap-3 pt-1">
+        <div className="h-px flex-1 bg-[color:var(--line)]" />
+        <span className="text-[12px] font-semibold text-[color:var(--ink-faint)]">또는</span>
+        <div className="h-px flex-1 bg-[color:var(--line)]" />
+      </div>
+
+      <Button variant="kakao" size="md" fullWidth disabled={loading} onClick={handleKakaoStart}>
+        {loading ? '확인 중' : '카카오로 계속하기'}
+      </Button>
+
+      <p className="pt-1 text-center text-[13px] text-[color:var(--ink-sub)]">
+        이미 계정이 있나요?{' '}
+        <Link href="/login" className="font-semibold text-[color:var(--primary)] hover:underline">
+          로그인
+        </Link>
+      </p>
+
+      {notice ? <InlineNotice title="로그인 준비 상태" description={notice} tone="blue" /> : null}
+    </div>
+  );
+}

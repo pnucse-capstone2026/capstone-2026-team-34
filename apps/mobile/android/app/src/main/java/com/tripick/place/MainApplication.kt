@@ -1,0 +1,34 @@
+package com.tripick.place
+
+import android.app.Application
+import com.facebook.react.PackageList
+import com.facebook.react.ReactApplication
+import com.facebook.react.ReactHost
+import com.facebook.react.ReactNativeApplicationEntryPoint.loadReactNative
+import com.facebook.react.defaults.DefaultReactHost.getDefaultReactHost
+import com.tripick.place.appinfo.AppInfoPackage
+import com.tripick.place.authtab.AuthTabPackage
+import com.tripick.place.filesave.FileSavePackage
+
+class MainApplication : Application(), ReactApplication {
+
+  override val reactHost: ReactHost by lazy {
+    getDefaultReactHost(
+      context = applicationContext,
+      packageList =
+        PackageList(this).packages.apply {
+          // 웹이 만든 이미지·PDF 를 다운로드 폴더에 저장하는 모듈 (WebView 는 data: URI 를 못 받는다)
+          add(FileSavePackage())
+          // 설정 화면이 웹 빌드 버전 대신 앱 versionName 을 보여주도록 값을 넘기는 모듈
+          add(AppInfoPackage())
+          // 카카오 로그인을 시스템 브라우저 대신 인앱 브라우저(Custom Tabs)로 여는 모듈
+          add(AuthTabPackage())
+        },
+    )
+  }
+
+  override fun onCreate() {
+    super.onCreate()
+    loadReactNative(this)
+  }
+}

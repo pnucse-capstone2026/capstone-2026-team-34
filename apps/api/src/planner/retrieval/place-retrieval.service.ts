@@ -1,0 +1,647 @@
+import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { getSeedCandidates, tasteTagsToKeywords } from './place-seeds';
+import { CragEvaluatorService } from './crag-evaluator.service';
+import { DestinationAnchorService } from './destination-anchor.service';
+import { KakaoLocalService } from './kakao-local.service';
+import { NaverSearchService, NEUTRAL_POPULARITY } from './naver-search.service';
+import { PlaceEmbeddingRepository, toKstDateString } from './place-embedding.repository';
+import {
+  destinationRegionFilter,
+  matchesRegionFilter,
+  placeRegionCodes,
+  type RegionFilter,
+} from './region-code';
+import { TextEmbeddingService } from '../../embedding/text-embedding.service';
+import { isEligibleItineraryCandidate } from './place-eligibility';
+import type {
+  CandidatePlace,
+  PoolCategoryQuota,
+  DestinationAnchor,
+  RawPlaceCandidate,
+  RetrievalContext,
+  RetrievalResult,
+  RetrievalSource,
+  VisitWindow,
+} from './types';
+
+/** 일정에 식사 슬롯을 채우는 카테고리. 앵커 반경이 충분한지 판정할 때 쓴다. */
+const DINING_CATEGORIES: ReadonlySet<string> = new Set(['restaurant', 'cafe']);
+
+/**
+ * 앵커 반경 확장 단계(m). 부족하면 다음 단계로 넓히고, 마지막까지 부족하면 지역 전역을 덧댄다.
+ *
+ * 실측 카탈로그(10,333행)에서 반경별 후보 수(괄호는 식당·카페)를 재서 정했다:
+ *
+ * | 앵커 | 2km | 5km | 10km |
+ * |---|---|---|---|
+ * | 광안리 | 17 (2) | 144 (61) | 368 (122) |
+ * | 서면역 | 36 (4) | 151 (62) | 386 (128) |
+ * | 감천문화마을 | 65 (25) | 107 (30) | 286 (98) |
+ * | 남이섬 | 7 (1) | 55 (24) | 96 (46) |
+ * | 에버랜드 | 2 (0) | 4 (1) | 15 (2) |
+ *
+ * 고정 반경이 안 되는 이유가 이 표에 다 있다 — 2km 로 고정하면 광안리에 식사 후보가 2곳뿐이고,
+ * 10km 로 고정하면 감천문화마을 여행이 부산 절반으로 번진다. 에버랜드처럼 카탈로그가 얇은
+ * 앵커는 어떤 반경으로도 못 채우므로 지역 폴백이 있어야 한다.
+ */
+const DEFAULT_RADIUS_STEPS_M = [2000, 5000, 10000] as const;
+
+/** 앵커 반경이 "충분하다"고 볼 최소 종류별 후보 수. 일정에 식사와 볼거리가 둘 다 필요하다. */
+const MIN_KIND_COUNT = 4;
+
+/** 호출자가 종류별 하한을 안 줄 때 쓰는 하루치 기본값 (끼니 2 · 카페 1 · 볼거리 2). */
+const DEFAULT_CATEGORY_QUOTA: PoolCategoryQuota = { restaurant: 2, cafe: 1, attraction: 2 };
+
+@Injectable()
+export class PlaceRetrievalService {
+  private readonly logger = new Logger(PlaceRetrievalService.name);
+
+  constructor(
+    private readonly config: ConfigService,
+    private readonly embeddings: TextEmbeddingService,
+    private readonly placeEmbeddings: PlaceEmbeddingRepository,
+    private readonly kakaoLocal: KakaoLocalService,
+    private readonly evaluator: CragEvaluatorService,
+    private readonly naverSearch: NaverSearchService,
+    private readonly anchors: DestinationAnchorService,
+  ) {}
+
+  async retrieve(inputContext: RetrievalContext): Promise<RetrievalResult> {
+    const totalStarted = Date.now();
+    const durations = {
+      popularity: 0,
+      anchor: 0,
+      embedding: 0,
+      seed: 0,
+      pgvector: 0,
+      kakao: 0,
+      rerank: 0,
+      total: 0,
+    };
+    type AsyncStage = 'popularity' | 'anchor' | 'embedding' | 'seed' | 'pgvector' | 'kakao';
+    const measure = async <T>(stage: AsyncStage, task: () => Promise<T>): Promise<T> => {
+      const started = Date.now();
+      try {
+        return await task();
+      } finally {
+        durations[stage] += Date.now() - started;
+      }
+    };
+    const rank = (candidates: RawPlaceCandidate[], context: RetrievalContext): CandidatePlace[] => {
+      const started = Date.now();
+      try {
+        return this.evaluator.rank(candidates, context);
+      } finally {
+        durations.rerank += Date.now() - started;
+      }
+    };
+
+    const queryText = this.buildQueryText(inputContext);
+    // 인기도·앵커·임베딩은 입력만 공유할 뿐 서로 의존하지 않는다. 콜드 경로가 세 지연의 합이
+    // 아니라 가장 느린 한 단계에 가까워지도록 동시에 시작한다.
+    const [popularityIndex, anchor, queryResult] = await Promise.all([
+      measure('popularity', () => this.naverSearch.getPopularityIndex(inputContext.destination)),
+      measure('anchor', () => this.anchors.resolve(inputContext.destination)),
+      measure('embedding', () => this.embeddings.embedWithSource(queryText)),
+    ]);
+    // 지역 코드는 한 번만 해석해 내려보낸다 — 소비측이 destination 문자열에서 각자
+    // 재계산하면 앵커로 알아낸 지역('광안리'→부산)을 못 보고 죽은 코드로 되돌아간다.
+    const regionFilter = anchor?.region ?? destinationRegionFilter(inputContext.destination);
+    const context: RetrievalContext = { ...inputContext, popularityIndex, regionFilter };
+    const limit = context.limit ?? 16;
+    // 종류별 하한. 플래너가 안 주면 하루치 기본값으로 본다.
+    const quota = context.categoryQuota ?? DEFAULT_CATEGORY_QUOTA;
+    const sources: RetrievalSource[] = [];
+    const rawCandidates: RawPlaceCandidate[] = [];
+    const queryEmbedding = queryResult.vector;
+    const semanticSearchReady = queryResult.source === 'remote';
+    // 차원이 맞는 취향 벡터만 사용 (차원 불일치 시 pgvector 코사인이 통째로 실패하는 것 방지)
+    const preferenceVector =
+      semanticSearchReady &&
+      context.preferenceVector &&
+      context.preferenceVector.length === queryEmbedding.length
+        ? context.preferenceVector
+        : undefined;
+    const memberPreferenceVectors = (context.memberPreferenceVectors ?? []).filter(
+      (vector) => semanticSearchReady && vector.length === queryEmbedding.length,
+    );
+    if (
+      context.memberPreferenceVectors &&
+      memberPreferenceVectors.length !== context.memberPreferenceVectors.length
+    ) {
+      this.logger.warn(
+        `그룹 취향 벡터 ${context.memberPreferenceVectors.length - memberPreferenceVectors.length}개를 질의 벡터 차원(${queryEmbedding.length}) 불일치로 제외합니다.`,
+      );
+    }
+    if (
+      semanticSearchReady &&
+      context.preferenceVector &&
+      context.preferenceVector.length !== queryEmbedding.length
+    ) {
+      this.logger.warn(
+        `취향 벡터 차원(${context.preferenceVector.length})이 질의 벡터(${queryEmbedding.length})와 달라 개인화를 건너뜁니다. reembed:preferences 로 재임베딩이 필요합니다.`,
+      );
+    }
+    if (!semanticSearchReady) {
+      this.logger.warn(
+        `질의 임베딩이 hash 폴백이라 pgvector 검색을 건너뜁니다 (destination=${context.destination}).`,
+      );
+    }
+    // 목적지/이벤트 질의 벡터에 저장된 취향 벡터를 가중 결합해 검색 자체를 개인화
+    const searchEmbedding = this.blendPreference(queryEmbedding, preferenceVector);
+
+    // 앵커가 있으면 그 지역 카탈로그는 이미 적재돼 있다(앵커 해석 자체가 지역을 알아낸 것).
+    // '광안리' 로 시드를 찾아 봐야 전용 카탈로그가 없어 매번 빈손으로 로그만 남는다.
+    if (!anchor && semanticSearchReady) {
+      await measure('seed', () => this.seedLocalCatalogIfNeeded(context.destination));
+    }
+
+    const poolSize = limit * this.candidatePoolMultiplier();
+    // 기간 있는 행사(축제)는 이 구간과 겹칠 때만 후보로 남는다. 여행 날짜를 모르면 오늘 기준.
+    const visitWindow = this.visitWindow(context);
+    const pgvector = await measure('pgvector', async () => {
+      if (!semanticSearchReady) return [];
+      if (anchor) {
+        const around = await this.searchAroundAnchor(
+          anchor,
+          searchEmbedding,
+          poolSize,
+          limit,
+          visitWindow,
+          quota,
+          preferenceVector,
+          queryResult.modelId,
+          memberPreferenceVectors,
+        );
+        // 확정된 반경을 컨텍스트에 실어 카카오 폴백이 같은 범위를 보게 한다.
+        context.anchor = { ...anchor, radiusM: around.radiusM };
+        return around.candidates;
+      }
+      return this.filterEligibleCandidates(
+        await this.placeEmbeddings.searchByEmbedding(
+          searchEmbedding,
+          { kind: 'region', region: regionFilter },
+          poolSize,
+          preferenceVector,
+          visitWindow,
+          queryResult.modelId,
+          memberPreferenceVectors,
+        ),
+        'pgvector',
+      );
+    });
+    if (pgvector.length > 0) {
+      sources.push('pgvector');
+      rawCandidates.push(...pgvector);
+    }
+
+    let ranked = rank(rawCandidates, context);
+    if (!this.isStrongEnough(ranked, limit)) {
+      // 카카오 키워드 폴백은 좌표를 못 주면(앵커·현재 위치 없는 평범한 행정구역 목적지)
+      // **전국이 사정권**이라 타지역 동명 장소가 섞인다. 지역 하드 게이트를 여기서 건다.
+      const kakao = await measure('kakao', async () =>
+        this.filterOutOfRegion(
+          this.filterEligibleCandidates(await this.kakaoLocal.search(context, limit * 2), 'kakao'),
+          regionFilter,
+        ),
+      );
+      if (kakao.length > 0) {
+        sources.push('kakao');
+        rawCandidates.push(...kakao);
+        ranked = rank(rawCandidates, context);
+      }
+    }
+
+    // 시드 폴백은 목적지 전용 카탈로그가 없으면 DEFAULT_SEEDS(서울 도심 좌표의 가짜 장소 6개)를
+    // 준다. 앵커를 아는 여행에 그걸 섞으면 부산 일정에 서울 좌표가 박혀 동선이 깨지므로,
+    // 실제 후보가 한 건도 없을 때만(=아무것도 안 주는 것보다는 나을 때) 허용한다.
+    const seedAllowed = !anchor || rawCandidates.length === 0;
+    if (!this.isStrongEnough(ranked, limit) && seedAllowed) {
+      const seeds = this.filterEligibleCandidates(getSeedCandidates(context.destination), 'seed');
+      sources.push('seed');
+      rawCandidates.push(...seeds);
+      ranked = rank(rawCandidates, context);
+    }
+
+    const minimumConfidence = this.minimumConfidence();
+    // 인지도는 "소프트 재랭킹"이라 순위만 낮출 뿐 후보를 탈락시키면 안 된다.
+    // 중립값 아래로 깎인 감점분은 accept 게이트에서만 되돌려, 언급 0 이라는 이유로
+    // minimumConfidence 를 밑돌아 제거되는 일을 막는다(정렬 순서엔 감점 그대로 반영).
+    // 되돌리는 폭은 상수가 아니라 **실효 가중치**여야 한다 — CRAG_RETRIEVAL_WEIGHT 를 바꾸면
+    // 인지도 가중도 비례 배분으로 함께 움직이므로, 상수를 쓰면 과·소보정이 된다.
+    const popularityWeight = this.evaluator.weights().popularity;
+    const gateConfidence = (candidate: CandidatePlace): number =>
+      candidate.confidence +
+      popularityWeight * Math.max(0, NEUTRAL_POPULARITY - candidate.crag.popularity);
+    const accepted = ranked.filter((candidate) => gateConfidence(candidate) >= minimumConfidence);
+    const finalPool = accepted.length >= Math.min(4, limit) ? accepted : ranked;
+    const selectStarted = Date.now();
+    const places = this.evaluator.selectTopDiverse(finalPool, limit, quota);
+    durations.rerank += Date.now() - selectStarted;
+    const averageConfidence = this.averageConfidence(places);
+    const rejectedCount = Math.max(0, ranked.length - accepted.length);
+
+    const popularCount = places.filter((place) => popularityIndex.mentions(place.name) > 0).length;
+    const scope = context.anchor
+      ? `anchor="${context.anchor.label}"/${context.anchor.radiusM / 1000}km`
+      : `region=${regionFilter.sido ?? regionFilter.sigungu ?? 'none'}`;
+    const groupLabel =
+      context.groupMemberCount && context.groupMemberCount > 1
+        ? ` group=${context.groupMemberCount}members/${memberPreferenceVectors.length}vectors`
+        : '';
+    durations.total = Date.now() - totalStarted;
+    this.logger.log(
+      `CRAG retrieval for "${context.destination}" ${scope} sources=${sources.join('+') || 'none'} avg=${averageConfidence.toFixed(2)} selected=${places.length} naver=${popularityIndex.docCount}docs/${popularCount}matched${groupLabel} ` +
+        `latency=${durations.total}ms stages(pop=${durations.popularity},anchor=${durations.anchor},embed=${durations.embedding},seed=${durations.seed},vector=${durations.pgvector},kakao=${durations.kakao},rank=${durations.rerank})`,
+    );
+    this.warnThinPool(context.destination, places, limit, quota, scope, sources);
+
+    return {
+      places,
+      trace: {
+        queryText,
+        sources: [...new Set(sources)],
+        fallbackUsed: sources.some((source) => source !== 'pgvector'),
+        averageConfidence,
+        rejectedCount,
+        embeddingSource: queryResult.source,
+        embeddingModel: queryResult.modelId,
+        durationsMs: durations,
+        ...(context.groupMemberCount && context.groupMemberCount > 1
+          ? {
+              groupPersonalization: {
+                memberCount: context.groupMemberCount,
+                vectorMemberCount: memberPreferenceVectors.length,
+              },
+            }
+          : {}),
+      },
+    };
+  }
+
+  /**
+   * 앵커 주변을 반경을 넓혀 가며 훑는다.
+   *
+   * 마지막 단계까지 부족하면 앵커가 알아낸 지역 전역 검색을 **덧댄다(교체가 아니다)** —
+   * 가까운 후보를 지역 상위 N 경쟁에 밀려 잃으면 앵커를 쓴 의미가 없다. id 중복은
+   * `evaluator.rank` 의 dedupe 가 접는다.
+   */
+  private async searchAroundAnchor(
+    anchor: DestinationAnchor,
+    embedding: number[],
+    poolSize: number,
+    limit: number,
+    visitWindow: VisitWindow,
+    quota: PoolCategoryQuota,
+    preferenceVector?: number[],
+    embeddingModel?: string,
+    memberPreferenceVectors?: number[][],
+  ): Promise<{ candidates: RawPlaceCandidate[]; radiusM: number }> {
+    const steps = this.radiusStepsM();
+    const search = async (radiusM: number): Promise<RawPlaceCandidate[]> =>
+      this.filterEligibleCandidates(
+        await this.placeEmbeddings.searchByEmbedding(
+          embedding,
+          { kind: 'anchor', center: anchor.coordinates, radiusM },
+          poolSize,
+          preferenceVector,
+          visitWindow,
+          embeddingModel,
+          memberPreferenceVectors,
+        ),
+        'pgvector',
+      );
+
+    let candidates: RawPlaceCandidate[] = [];
+    for (const step of steps) {
+      candidates = await search(step);
+      if (this.isAnchorPoolSufficient(candidates, limit, quota)) {
+        this.logger.log(
+          `앵커 "${anchor.label}" 반경 ${step / 1000}km 후보 ${candidates.length}건으로 확정`,
+        );
+        return { candidates, radiusM: step };
+      }
+    }
+
+    const widest = steps[steps.length - 1]!;
+    const regional = this.filterEligibleCandidates(
+      await this.placeEmbeddings.searchByEmbedding(
+        embedding,
+        { kind: 'region', region: anchor.region },
+        poolSize,
+        preferenceVector,
+        visitWindow,
+        embeddingModel,
+        memberPreferenceVectors,
+      ),
+      'pgvector',
+    );
+    const seen = new Set(candidates.map((candidate) => candidate.id));
+    const merged = [...candidates, ...regional.filter((candidate) => !seen.has(candidate.id))];
+    this.logger.log(
+      `앵커 "${anchor.label}" 최대 반경 ${widest / 1000}km 로도 후보가 얇아(${candidates.length}건) ` +
+        `${anchor.region.sido ?? anchor.region.sigungu} 전역 ${regional.length}건을 덧댔습니다.`,
+    );
+    return { candidates: merged, radiusM: widest };
+  }
+
+  /**
+   * 앵커 반경 후보 풀이 이 반경에서 멈춰도 될 만큼 찼는지.
+   *
+   * **개수만 보면 안 된다** — 실측에서 광안리 2km 는 17건이나 되는데 식당·카페가 2곳뿐이라
+   * 하루치 식사 슬롯도 못 채운다. 그래서 종류별 하한을 함께 본다. 전체 개수는 최종 선택
+   * 수(limit)의 2배를 요구한다 — 그 정도는 돼야 인지도·취향 재정렬이 손댈 여지가 생긴다.
+   */
+  private isAnchorPoolSufficient(
+    candidates: RawPlaceCandidate[],
+    limit: number,
+    quota: PoolCategoryQuota,
+  ): boolean {
+    if (candidates.length < limit * 2) return false;
+    const dining = candidates.filter((candidate) =>
+      DINING_CATEGORIES.has(candidate.category),
+    ).length;
+    if (dining < MIN_KIND_COUNT || candidates.length - dining < MIN_KIND_COUNT) return false;
+    // 카페를 따로 세는 이유 — 카탈로그 비중이 관광지·음식점의 1/6 이라, 식음을 한 덩어리로
+    // 세면 음식점만으로 하한이 채워져 카페 0건인 반경에서 멈춘다.
+    if (quota.cafe <= 0) return true;
+    return candidates.filter((candidate) => candidate.category === 'cafe').length >= 1;
+  }
+
+  /**
+   * 후보를 방문할 날짜 구간. 여행 날짜를 모르는 호출(스크립트·진단)은 오늘 하루로 본다 —
+   * 이미 끝난 행사를 후보로 내주지 않는 쪽이 안전한 기본값이다.
+   */
+  private visitWindow(context: RetrievalContext): VisitWindow {
+    if (context.visitWindow) {
+      const { from, to } = context.visitWindow;
+      // 뒤집힌 구간이 들어오면 조건이 아무것도 통과시키지 못하므로 순서를 바로잡는다.
+      return from <= to ? { from, to } : { from: to, to: from };
+    }
+    const day = toKstDateString(context.startAt ?? new Date());
+    return { from: day, to: day };
+  }
+
+  /** 앵커 반경 확장 단계(m). 오름차순으로 정렬해 넓혀 가는 순서를 보장한다. */
+  private radiusStepsM(): number[] {
+    const parsed = this.config
+      .get<string>('PLACE_ANCHOR_RADIUS_STEPS_M', '')
+      .split(',')
+      .map((token) => Number(token.trim()))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    return parsed.length > 0 ? parsed.sort((a, b) => a - b) : [...DEFAULT_RADIUS_STEPS_M];
+  }
+
+  private async seedLocalCatalogIfNeeded(destination: string): Promise<void> {
+    if (!this.autoSeedEnabled()) return;
+    // 게이트는 검색과 같은 정본 코드로 센다 — seed 슬러그 라벨만 세던 시절엔 적재된 카탈로그
+    // (라벨 '서울특별시')를 못 보고 매 지역에 시드를 덧칠했다.
+    const count = await this.placeEmbeddings.countRegionCandidates(destination);
+    if (count > 0) return;
+
+    try {
+      await this.placeEmbeddings.seedRegion(destination, (text) =>
+        this.embeddings.embedWithSource(text),
+      );
+    } catch (error) {
+      this.logger.warn(
+        `Local place embedding seed skipped: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
+   * 질의 벡터와 취향 벡터를 가중 결합한 뒤 L2 정규화.
+   * weight=1 이면 순수 질의 벡터, 0 이면 순수 취향 벡터.
+   */
+  private blendPreference(query: number[], preference?: number[]): number[] {
+    if (!preference || preference.length !== query.length) return query;
+    const weight = this.preferenceBlendWeight();
+    const blended = query.map(
+      (value, index) => value * weight + (preference[index] ?? 0) * (1 - weight),
+    );
+    const norm = Math.sqrt(blended.reduce((sum, value) => sum + value * value, 0));
+    if (norm === 0) return query;
+    return blended.map((value) => value / norm);
+  }
+
+  /**
+   * 질의 벡터와 취향 벡터의 결합 비율 (1 이면 순수 질의).
+   *
+   * 0.6 → 0.85. 골든셋 스윕에서 블렌드를 낮출수록 목적지 대표 장소를 잘 찾는다
+   * (R|cat 0.6→0.337, 0.85→0.371, 1.0→0.370). **개인화를 버리는 결정이 아니다** —
+   * 취향은 질의 텍스트의 `taste:` 태그와 CRAG taste 항으로도 들어가고, 벡터 블렌드는 세 번째
+   * 채널이다. 그 세 번째가 목적지 정합을 깎고 있었다. 1.0(완전 차단) 대신 0.85 인 이유는
+   * 지표가 1.0 과 동등한 범위이고, 사진 취향이 강한 사용자에게 줄 미세 조정을 남겨 두는 쪽이
+   * 안전해서다.
+   *
+   * ⚠️ 골든셋 정답은 '그 목적지의 유명 명소' 라 개인화 품질 자체는 측정하지 못한다.
+   * 이 값을 더 내리는(=블렌드를 더 끄는) 근거로 이 지표만 쓰면 안 된다.
+   */
+  /**
+   * 최종 개수(limit)의 몇 배까지 pgvector 후보를 뽑을지.
+   *
+   * 이 배수가 곧 **인지도·취향 재정렬이 손댈 수 있는 범위의 한계**다 — 선발은 순전히 벡터
+   * 거리(`ORDER BY embedding <=> query`)이고 인지도는 그 뒤의 재정렬에만 관여하므로,
+   * 풀에 못 들어온 장소는 인지도가 아무리 높아도 결과에 나올 길이 없다.
+   *
+   * ⚠️ **카탈로그 크기에 묶인 값이다.** 지역 행수가 늘면 같은 배수가 더 좁은 비율이 된다 —
+   * 10 은 카탈로그 10,333행 시절의 무릎이었고(경기 615행 중 풀 160 = 26%), 전국 적재로
+   * 40,304행이 되자 같은 풀이 경기 6,524행의 **2.5%** 가 되어 정답이 선발에서 통째로 빠졌다.
+   * 적재를 크게 늘렸으면 이 값을 반드시 다시 스윕할 것.
+   *
+   * 골든셋 16케이스 스윕 + 경기 목적지 응답시간 실측:
+   *
+   * | 배수 | 풀 | R@10 | R\|cat | 응답 |
+   * |---|---|---|---|---|
+   * | 10 | 160 | 0.356 | 0.426 | 53ms |
+   * | **20** | 320 | **0.423** | 0.524 | **60ms** |
+   * | 40 | 640 | 0.417 | 0.541 | 75ms |
+   * | 80 | 1280 | 0.417 | 0.547 | 120ms |
+   *
+   * ## 20 → 40 (인지도 포화를 고친 뒤 재측정)
+   *
+   * 위 표의 "20 이 무릎"은 **인지도 곡선이 8회 언급에서 포화하던 시절의 결론**이었다. 그때는 풀을
+   * 키워도 상위 16 이 전부 popularity 1.00 이라 순서가 사실상 무작위였고, 그래서 40·80 이
+   * R@10 을 못 올렸다. `NAVER_POPULARITY_LOG_SLOPE` 를 0.12 로 내려 포화를 풀고 다시 재면
+   * 순위가 바뀐다:
+   *
+   * | 배수 | R@5 | R@10 | R\|cat | MRR |
+   * |---|---|---|---|---|
+   * | 20 | 0.263 | 0.408 | 0.487 | 0.716 |
+   * | **40** | **0.264** | **0.438** | **0.526** | **0.716** |
+   * | 80 | 0.249 | 0.425 | 0.532 | 0.702 |
+   * | 160 | 0.249 | 0.426 | 0.532 | 0.702 |
+   *
+   * 40 이 새 무릎이다 — 5케이스 개선(경주-문화 0.40→0.80, 경주-실내 0.33→0.50, 여수·광주),
+   * 1케이스 악화(전주 0.57→0.43). 80 부터는 R@10·MRR 이 도로 내려가고 160 은 80 과 같다.
+   *
+   * ⚠️ **recall@k 는 풀 크기에 단조가 아니다.** 풀이 커지면 상위집합이라 후보를 잃을 수 없지만
+   * top-k 는 순위라, 새로 들어온 후보가 정답을 k 밖으로 밀어낼 수 있다. 실제로 경주에서 배수
+   * 80 이 '경주황리단길 쌀십원빵'·'신라명가 황리단길 본점 경주빵찰보리빵'을 올리고 '동궁과월지'·
+   * '교촌마을'을 밀어냈다 — 랜드마크 이름을 품은 상호가 그 인지도를 가져가는 패턴이다.
+   *
+   * **SQL 비용은 LIMIT 과 거의 무관하다**(경기 기준 33~35ms 고정) — 지역 pre-filter 가 이미 그
+   * 지역 전체 행의 거리를 계산하므로 LIMIT 은 top-N 힙 크기만 바꾼다. 늘어나는 건 Node 쪽
+   * 재정렬이고, 특히 `collapseNearDuplicates` 가 O(n²) 라 풀이 커질수록 이쪽이 지배한다.
+   */
+  private candidatePoolMultiplier(): number {
+    const value = this.readNumber('PLACE_CANDIDATE_POOL_MULTIPLIER', 40);
+    return Math.max(1, Math.floor(value));
+  }
+
+  private preferenceBlendWeight(): number {
+    const weight = this.readNumber('PREFERENCE_BLEND_WEIGHT', 0.85);
+    return Math.max(0, Math.min(1, weight));
+  }
+
+  private buildQueryText(context: RetrievalContext): string {
+    const tags = tasteTagsToKeywords(context.tasteTags);
+    const trigger = context.trigger ? `event:${context.trigger}` : 'event:initial';
+    const notes = context.notes?.trim() ? `notes:${context.notes.trim()}` : '';
+    return [
+      `destination:${context.destination}`,
+      trigger,
+      tags.length > 0 ? `taste:${tags.join(', ')}` : '',
+      notes,
+    ]
+      .filter(Boolean)
+      .join(' | ');
+  }
+
+  private isStrongEnough(candidates: CandidatePlace[], limit: number): boolean {
+    const targetCount = Math.min(limit, 8);
+    if (candidates.length < Math.min(4, targetCount)) return false;
+    const top = candidates.slice(0, targetCount);
+    return this.averageConfidence(top) >= this.targetConfidence();
+  }
+
+  /**
+   * 목적지 지역이 확정된 검색에서 **다른 지역 후보를 아예 뺀다.**
+   *
+   * CRAG `localityScore` 는 지역 불일치를 0.32 로 감점만 하고 탈락시키지 않는다. 풀이 얇으면
+   * 그대로 살아남아 일정에 박히는데, 그 피해가 순위 문제가 아니다 — 실측에서 경주 여행에
+   * 단양의 '경주식당'(직선 152km)이 들어가 이동시간 457분으로 하루를 통째로 삼켰다.
+   *
+   * 두 가지를 지킨다.
+   *   1. **지역을 못 읽는 후보는 남긴다.** 데이터 없음을 '다른 지역'으로 읽으면 안 된다
+   *      (`localityScore` 가 판정 불가를 중립값으로 두는 것과 같은 원칙).
+   *   2. **한 건도 안 맞으면 게이트를 포기한다.** `destinationRegionFilter` 는 임의 문자열에서도
+   *      시군구 코드를 만들어 내므로('발리' → '발리'), 그대로 두면 전부 탈락해 후보가 0 이 된다.
+   */
+  /**
+   * 요청한 만큼 못 채운 풀을 경고로 남긴다.
+   *
+   * 왜 — 얇은 풀은 **조용히** 짧은 일정이 된다. 플래너는 풀에 있는 만큼만 배치하고, 그 결과가
+   * 하루 목표에 못 미쳐도 제약 검증은 통과한다(적게 담은 하루는 아무 제약도 안 어긴다).
+   * 그래서 "3일 여행인데 3일차가 비어 있음"이 성공 응답으로 나갔다. 정상 로그의 `selected=`
+   * 만으로는 그게 정상인지 부족인지 구분이 안 돼서, 요청치·종류별 하한과 나란히 찍는다.
+   *
+   * 던지지 않는 이유 — 짧은 일정이라도 사용자에겐 쓸모가 있고, 카탈로그가 얇은 지역은
+   * 재시도해도 늘지 않아 던지면 그 목적지는 영구히 일정을 못 만든다. 운영이 볼 신호만 남긴다.
+   */
+  private warnThinPool(
+    destination: string,
+    places: CandidatePlace[],
+    limit: number,
+    quota: PoolCategoryQuota,
+    scope: string,
+    sources: string[],
+  ): void {
+    const counts = {
+      restaurant: places.filter((place) => place.category === 'restaurant').length,
+      cafe: places.filter((place) => place.category === 'cafe').length,
+      attraction: places.filter(
+        (place) => place.category !== 'restaurant' && place.category !== 'cafe',
+      ).length,
+    };
+    const unmet = (['restaurant', 'cafe', 'attraction'] as const)
+      .filter((kind) => counts[kind] < quota[kind])
+      .map((kind) => `${kind} ${counts[kind]}/${quota[kind]}`);
+    if (places.length >= limit && unmet.length === 0) return;
+
+    // 시드는 카탈로그가 아니라 코드에 박힌 표본이다. 얇은 풀은 늘 시드로 메워지므로, 그걸
+    // 안 적으면 "9/12건"이 실제보다 건강해 보인다 — 그 9건 중 6건이 카탈로그 밖일 수 있다.
+    const padded = sources.includes('seed');
+    this.logger.warn(
+      `후보 풀 부족 "${destination}" ${scope} — ${places.length}/${limit}건` +
+        ` (음식점 ${counts.restaurant} · 카페 ${counts.cafe} · 볼거리 ${counts.attraction})` +
+        (padded ? ' · 시드 표본으로 메움(카탈로그 후보 부족)' : '') +
+        (unmet.length > 0 ? ` · 종류별 하한 미달: ${unmet.join(', ')}` : '') +
+        '. 일정이 목표보다 짧게 나올 수 있습니다.',
+    );
+  }
+
+  private filterOutOfRegion(
+    candidates: RawPlaceCandidate[],
+    region: RegionFilter,
+  ): RawPlaceCandidate[] {
+    if (!region.sido && !region.sigungu) return candidates;
+
+    const kept = candidates.filter((candidate) => {
+      const { regionCode, sigunguCode } = placeRegionCodes(
+        candidate.destinationRegion ?? null,
+        null,
+        candidate.address ?? null,
+      );
+      if (!regionCode && !sigunguCode) return true;
+      return matchesRegionFilter(region, regionCode, sigunguCode);
+    });
+
+    if (kept.length === 0) return candidates;
+    const dropped = candidates.length - kept.length;
+    if (dropped > 0) {
+      this.logger.debug(`지역 이탈 후보 ${dropped}건 제외 (기대=${region.sido ?? region.sigungu})`);
+    }
+    return kept;
+  }
+
+  private filterEligibleCandidates(
+    candidates: RawPlaceCandidate[],
+    source: RetrievalSource,
+  ): RawPlaceCandidate[] {
+    const eligible = candidates.filter(isEligibleItineraryCandidate);
+    const excludedCount = candidates.length - eligible.length;
+    if (excludedCount > 0) {
+      this.logger.debug(`자동 일정 부적합 장소 ${excludedCount}건 제외 (source=${source})`);
+    }
+    return eligible;
+  }
+
+  private averageConfidence(candidates: CandidatePlace[]): number {
+    if (candidates.length === 0) return 0;
+    return candidates.reduce((sum, candidate) => sum + candidate.confidence, 0) / candidates.length;
+  }
+
+  private minimumConfidence(): number {
+    return this.readNumber('CRAG_MIN_CONFIDENCE', 0.52);
+  }
+
+  /**
+   * 이 값을 밑돌면 카카오·시드 폴백을 부른다.
+   *
+   * 0.64 → 0.61. **품질 기준을 낮춘 게 아니라 가중표 변경분을 되맞춘 것이다** — `dataQuality`
+   * 항(전 후보 1.000 인 상수)을 제거하자 남은 몫이 값이 1 보다 작은 항들로 비례 배분돼 모든 후보의
+   * confidence 가 일률적으로 **0.02 내려갔다**(케이스별 0.018~0.029). 임계는 절대값이라 그대로
+   * 두면 순위가 아무것도 안 바뀌었는데 폴백만 새로 걸린다 — 실측에서 daegu 케이스가
+   * top-8 평균 0.648 → 0.619 로 넘어가 카카오·시드를 불렀고, **결과 상위 5개와 지표는 완전히
+   * 동일**했다(외부 API 호출만 추가).
+   *
+   * ⚠️ 절대 임계는 가중표에 묶여 있다 — 항을 더하거나 빼면 여기도 같이 재보정해야 한다.
+   * accept 게이트(`CRAG_MIN_CONFIDENCE` 0.52)는 선택 후보 최저값이 0.589 로 여유가 커 그대로 뒀다.
+   */
+  private targetConfidence(): number {
+    return this.readNumber('CRAG_TARGET_CONFIDENCE', 0.61);
+  }
+
+  private autoSeedEnabled(): boolean {
+    const raw = this.config.get<string>('PLACE_RETRIEVAL_AUTO_SEED', 'true');
+    return raw !== 'false';
+  }
+
+  private readNumber(key: string, fallback: number): number {
+    const value = Number(this.config.get<string | number>(key, fallback));
+    return Number.isFinite(value) ? value : fallback;
+  }
+}

@@ -1,0 +1,83 @@
+/// <reference types="jest" />
+
+import axios from 'axios';
+import type { ConfigService } from '@nestjs/config';
+import { TextEmbeddingService } from '../../src/embedding/text-embedding.service';
+
+jest.mock('axios');
+const mockedPost = axios.post as jest.Mock;
+
+function makeService(overrides: Record<string, string> = {}): TextEmbeddingService {
+  const config = {
+    get: (key: string, def?: unknown) => (key in overrides ? overrides[key] : def),
+  } as unknown as ConfigService;
+  return new TextEmbeddingService(config);
+}
+
+describe('TextEmbeddingService.embedWithSource', () => {
+  afterEach(() => jest.resetAllMocks());
+
+  it('reports source=remote when the embedding server responds', async () => {
+    mockedPost.mockResolvedValue({ data: { data: [{ embedding: [0.1, 0.2, 0.3] }] } });
+    const result = await makeService({ LLM_EMBEDDING_DIMENSIONS: '3' }).embedWithSource('테스트');
+    expect(result.source).toBe('remote');
+    expect(result.modelId).toBe('text-embedding-model');
+    expect(result.vector).toHaveLength(3); // remote dimensions must match the configured model
+    expect(result.remoteDimensions).toBe(3); // 정규화 전 원본 차원 (차원 불일치 감지용)
+  });
+
+  it('falls back to source=hash when the embedding server is unavailable', async () => {
+    mockedPost.mockRejectedValue(new Error('ECONNREFUSED'));
+    const result = await makeService().embedWithSource('테스트');
+    expect(result.source).toBe('hash');
+    expect(result.modelId).toBe('hash-fnv1a-v1:1024');
+    expect(result.vector).toHaveLength(1024);
+    expect(result.remoteDimensions).toBeUndefined(); // hash 폴백은 원본 차원 없음
+  });
+
+  it('uses the configured remote model as the vector-space id', async () => {
+    mockedPost.mockResolvedValue({ data: { data: [{ embedding: [0.1, 0.2] }] } });
+    const result = await makeService({ LLM_EMBEDDING_MODEL: 'bge-m3-ko-v2', LLM_EMBEDDING_DIMENSIONS: '2' }).embedWithSource(
+      '테스트',
+    );
+    expect(result.modelId).toBe('bge-m3-ko-v2');
+  });
+
+  it('embed() still returns just the vector', async () => {
+    mockedPost.mockRejectedValue(new Error('down'));
+    const vector = await makeService().embed('테스트');
+    expect(Array.isArray(vector)).toBe(true);
+    expect(vector).toHaveLength(1024);
+  });
+
+  it.each([[1, 2], [0, 0, 0], [NaN, 1, 0], [Infinity, 1, 0]])('rejects an invalid semantic vector %j', async (...vector) => {
+    mockedPost.mockResolvedValue({ data: { data: [{ embedding: vector }] } });
+    const result = await makeService({ LLM_EMBEDDING_DIMENSIONS: '3' }).embedWithSource('test');
+    expect(result.source).toBe('hash');
+    expect(result.vector.every(Number.isFinite)).toBe(true);
+  });
+});
+
+describe('TextEmbeddingService embedding endpoint routing', () => {
+  afterEach(() => jest.resetAllMocks());
+
+  it('uses LLM_EMBEDDING_BASE_URL when set (separate embedding server)', async () => {
+    mockedPost.mockResolvedValue({ data: { data: [{ embedding: [0.1] }] } });
+    await makeService({ LLM_EMBEDDING_BASE_URL: 'http://localhost:8081/v1' }).embed('테스트');
+    expect(mockedPost).toHaveBeenCalledWith(
+      'http://localhost:8081/v1/embeddings',
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it('falls back to LLM_BASE_URL when embedding base url is unset', async () => {
+    mockedPost.mockResolvedValue({ data: { data: [{ embedding: [0.1] }] } });
+    await makeService({ LLM_BASE_URL: 'http://localhost:8080/v1' }).embed('테스트');
+    expect(mockedPost).toHaveBeenCalledWith(
+      'http://localhost:8080/v1/embeddings',
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+});

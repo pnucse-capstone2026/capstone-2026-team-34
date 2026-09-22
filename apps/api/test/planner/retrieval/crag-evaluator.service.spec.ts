@@ -1,0 +1,795 @@
+/// <reference types="jest" />
+
+import type { ConfigService } from '@nestjs/config';
+import { CragEvaluatorService } from '../../../src/planner/retrieval/crag-evaluator.service';
+import { DEFAULT_RETRIEVAL_WEIGHT } from '../../../src/planner/retrieval/retrieval-rank';
+import type { CandidatePlace, RawPlaceCandidate, RetrievalContext } from '../../../src/planner/retrieval/types';
+
+describe('CragEvaluatorService', () => {
+  const service = new CragEvaluatorService();
+
+  const busanContext: RetrievalContext = {
+    userId: 'user-1',
+    destination: '부산',
+    trigger: 'manual',
+    tasteTags: {
+      food: ['cafe'],
+      mood: ['romantic'],
+      environment: ['beach'],
+      confidence: 0.9,
+    },
+  };
+
+  it('ranks candidates by retrieval quality, taste match, locality, and event fit', () => {
+    const candidates: RawPlaceCandidate[] = [
+      {
+        id: 'wrong-region',
+        name: '성수 감도 카페',
+        category: 'cafe',
+        address: '서울 성동구 연무장길 45',
+        coordinates: { lat: 37.5441, lng: 127.0541 },
+        source: 'pgvector',
+        similarity: 0.93,
+        tags: ['cafe', 'city', 'healing'],
+        destinationRegion: 'seoul',
+      },
+      {
+        id: 'right-region',
+        name: '광안리 브런치 카페',
+        category: 'cafe',
+        address: '부산 수영구 광안해변로 219',
+        coordinates: { lat: 35.1532, lng: 129.1185 },
+        source: 'pgvector',
+        similarity: 0.86,
+        tags: ['cafe', 'beach', 'romantic'],
+        destinationRegion: 'busan',
+      },
+    ];
+
+    const ranked = service.rank(candidates, busanContext);
+
+    expect(ranked[0]!.id).toBe('right-region');
+    expect(ranked[0]!.crag.matchedTags).toEqual(['cafe', 'beach', 'romantic']);
+    expect(ranked[1]!.crag.penalties).toContain('destination-mismatch');
+  });
+
+  it('treats newly added dining/onsen tags as indoor on weather reroute', () => {
+    // 확장된 어휘(seafood·hotspring 등)도 실내 후보로 대접받아야 비 오는 날 우선된다.
+    const weatherContext: RetrievalContext = {
+      userId: 'user-1',
+      destination: '부산',
+      trigger: 'weather',
+      tasteTags: { food: ['korean'], mood: ['healing'], environment: ['nature'], confidence: 0.5 },
+    };
+    const indoor: RawPlaceCandidate = {
+      id: 'indoor',
+      name: '실내 후보',
+      category: 'restaurant',
+      address: '부산 수영구 어딘가로 1',
+      coordinates: { lat: 35.15, lng: 129.11 },
+      source: 'seed',
+      tags: ['seafood'],
+      destinationRegion: 'busan',
+    };
+    const outdoor: RawPlaceCandidate = {
+      ...indoor,
+      id: 'outdoor',
+      name: '실외 후보',
+      tags: ['beach'],
+    };
+
+    const ranked = service.rank([outdoor, indoor], weatherContext);
+
+    expect(ranked[0]!.id).toBe('indoor');
+    expect(ranked[0]!.confidence).toBeGreaterThan(ranked[1]!.confidence);
+  });
+
+  it('같은 장소를 가리키는 근접 중복 후보를 접고 자리를 비운다', () => {
+    // 실측: 제주 상위 16칸 중 1·2위가 둘 다 '한라산'(다른 kakao id, 1.9km) 이었다.
+    const jeju: RetrievalContext = { userId: 'user-1', destination: '제주', trigger: 'manual' };
+    const ranked = service.rank(
+      [
+        {
+          id: 'hallasan-a',
+          name: '한라산',
+          category: 'attraction',
+          address: '제주특별자치도 제주시 오등동 산 182',
+          coordinates: { lat: 33.37666, lng: 126.54244 },
+          source: 'pgvector',
+          similarity: 0.78,
+          destinationRegion: '제주도',
+        },
+        {
+          id: 'hallasan-b',
+          name: '한라산',
+          category: 'attraction',
+          address: '제주특별자치도 서귀포시 서홍동 산 1-1',
+          coordinates: { lat: 33.36142, lng: 126.52942 },
+          source: 'pgvector',
+          similarity: 0.77,
+          destinationRegion: '제주도',
+        },
+        {
+          id: 'bijarim',
+          name: '비자림',
+          category: 'attraction',
+          address: '제주특별자치도 제주시 구좌읍 비자숲길 55',
+          coordinates: { lat: 33.4899, lng: 126.8135 },
+          source: 'pgvector',
+          similarity: 0.76,
+          destinationRegion: '제주도',
+        },
+      ],
+      jeju,
+    );
+
+    expect(ranked.map((candidate) => candidate.id)).toEqual(['hallasan-a', 'bijarim']);
+  });
+
+  it('keeps selected candidates diverse before filling the rest', () => {
+    const ranked = service.rank(
+      [
+        ...Array.from({ length: 4 }, (_, index) => ({
+          id: `cafe-${index}`,
+          name: `부산 카페 ${index}`,
+          category: 'cafe',
+          address: '부산 수영구 광안해변로 219',
+          coordinates: { lat: 35.1532 + index * 0.001, lng: 129.1185 },
+          source: 'seed' as const,
+          tags: ['cafe', 'beach', 'romantic'],
+          destinationRegion: 'busan',
+        })),
+        {
+          id: 'museum',
+          name: '부산현대미술관',
+          category: 'attraction',
+          address: '부산 사하구 낙동남로 1191',
+          coordinates: { lat: 35.1049, lng: 128.9668 },
+          source: 'seed' as const,
+          tags: ['cultural', 'city', 'family'],
+          destinationRegion: 'busan',
+        },
+      ],
+      busanContext,
+    );
+
+    const selected = service.selectTopDiverse(ranked, 4);
+
+    expect(selected.some((candidate) => candidate.category === 'attraction')).toBe(true);
+    expect(selected.filter((candidate) => candidate.category === 'cafe')).toHaveLength(3);
+  });
+
+  it('reranks by stored preference vector similarity when available', () => {
+    const base: RawPlaceCandidate = {
+      id: 'a',
+      name: '광안리 브런치 카페',
+      category: 'cafe',
+      address: '부산 수영구 광안해변로 219',
+      coordinates: { lat: 35.1532, lng: 129.1185 },
+      source: 'pgvector',
+      similarity: 0.85,
+      tags: ['cafe', 'beach', 'romantic'],
+      destinationRegion: 'busan',
+    };
+
+    const highPref = service.rank([{ ...base, preferenceSimilarity: 0.95 }], busanContext)[0]!;
+    const lowPref = service.rank([{ ...base, preferenceSimilarity: -0.5 }], busanContext)[0]!;
+
+    expect(highPref.crag.personalization).toBeGreaterThan(lowPref.crag.personalization!);
+    expect(highPref.crag.taste).toBeGreaterThan(lowPref.crag.taste);
+    expect(highPref.confidence).toBeGreaterThan(lowPref.confidence);
+  });
+
+  it('penalizes a high-average candidate that strongly excludes one group member', () => {
+    const base: RawPlaceCandidate = {
+      id: 'base',
+      name: '그룹 후보',
+      category: 'attraction',
+      address: '부산 수영구 광안해변로 1',
+      coordinates: { lat: 35.1532, lng: 129.1185 },
+      source: 'pgvector',
+      similarity: 0.85,
+      tags: ['beach', 'romantic'],
+      destinationRegion: 'busan',
+    };
+    // raw cosine 기준 polar 평균(0.275)이 balanced(0.2)보다 높지만, 한 멤버는 -0.4로 소외된다.
+    const ranked = service.rank(
+      [
+        {
+          ...base,
+          id: 'polar',
+          name: '다수 취향 특화 후보',
+          memberPreferenceSimilarities: [0.95, -0.4],
+        },
+        {
+          ...base,
+          id: 'balanced',
+          name: '모두에게 균형 후보',
+          memberPreferenceSimilarities: [0.2, 0.2],
+        },
+      ],
+      busanContext,
+    );
+
+    expect(ranked.map((candidate) => candidate.id)).toEqual(['balanced', 'polar']);
+    expect(ranked[0]!.crag.groupPersonalization).toMatchObject({
+      average: 0.6,
+      least: 0.6,
+      memberCount: 2,
+    });
+    expect(ranked[1]!.crag.groupPersonalization!.least).toBeCloseTo(0.3);
+    expect(ranked[1]!.reason).toContain('그룹 최저 만족 30%');
+  });
+
+  it('includes vectorless members in least-member fairness through per-member tags', () => {
+    const context: RetrievalContext = {
+      ...busanContext,
+      memberTasteTags: [
+        { food: ['cafe'], mood: ['romantic'], environment: ['beach'], confidence: 1 },
+        { food: ['korean'], mood: ['cultural'], environment: ['village'], confidence: 1 },
+      ],
+    };
+    const base: RawPlaceCandidate = {
+      id: 'base',
+      name: '후보',
+      category: 'attraction',
+      address: '부산 수영구',
+      coordinates: { lat: 35.15, lng: 129.11 },
+      source: 'seed',
+      similarity: 0.8,
+      destinationRegion: 'busan',
+    };
+    const ranked = service.rank(
+      [
+        { ...base, id: 'one-sided', name: '한쪽 취향 후보', tags: ['cafe', 'romantic', 'beach'] },
+        {
+          ...base,
+          id: 'balanced-tags',
+          name: '양쪽 취향 후보',
+          tags: ['cafe', 'romantic', 'korean', 'cultural', 'village'],
+        },
+      ],
+      context,
+    );
+
+    expect(ranked.map((candidate) => candidate.id)).toEqual(['balanced-tags', 'one-sided']);
+    expect(ranked[0]!.crag.taste).toBeGreaterThan(ranked[1]!.crag.taste);
+  });
+
+  it('weights tag matching by photo-analysis confidence', () => {
+    const candidate: RawPlaceCandidate = {
+      id: 'matched-cafe',
+      name: '광안리 브런치 카페',
+      category: 'cafe',
+      address: '부산 수영구 광안해변로 219',
+      coordinates: { lat: 35.1532, lng: 129.1185 },
+      source: 'pgvector',
+      similarity: 0.8,
+      tags: ['cafe', 'beach', 'romantic'],
+      destinationRegion: 'busan',
+    };
+
+    const highConfidence = service.rank([candidate], busanContext)[0]!;
+    const lowConfidence = service.rank([candidate], {
+      ...busanContext,
+      tasteTags: { ...busanContext.tasteTags!, confidence: 0.4 },
+    })[0]!;
+
+    expect(highConfidence.crag.taste).toBeGreaterThan(lowConfidence.crag.taste);
+    expect(highConfidence.confidence).toBeGreaterThan(lowConfidence.confidence);
+  });
+
+  it('ignores matched tags below the actionable confidence threshold', () => {
+    const ranked = service.rank(
+      [
+        {
+          id: 'uncertain-cafe',
+          name: '광안리 브런치 카페',
+          category: 'cafe',
+          address: '부산 수영구 광안해변로 219',
+          coordinates: { lat: 35.1532, lng: 129.1185 },
+          source: 'seed',
+          tags: ['cafe', 'beach', 'romantic'],
+          destinationRegion: 'busan',
+        },
+      ],
+      {
+        ...busanContext,
+        tasteTags: { ...busanContext.tasteTags!, confidence: 0.2 },
+      },
+    );
+
+    expect(ranked[0]!.crag.matchedTags).toEqual([]);
+    expect(ranked[0]!.crag.taste).toBe(0.56);
+  });
+
+  it('demotes a place unmentioned in Naver recommendations below a mentioned twin', () => {
+    const twin = (id: string, name: string): RawPlaceCandidate => ({
+      id,
+      name,
+      category: 'cafe',
+      address: '부산 수영구 광안해변로 219',
+      coordinates: { lat: 35.1532, lng: 129.1185 },
+      source: 'pgvector',
+      similarity: 0.88,
+      tags: ['cafe', 'beach', 'romantic'],
+      destinationRegion: 'busan',
+    });
+    // 두 후보는 유명세만 다르다: '광안리'는 추천 글에 있고 '무명'은 없다.
+    const popularityIndex = {
+      docCount: 4,
+      mentions: (name: string) => (name.includes('광안리') ? 5 : 0),
+      score: (name: string) => (name.includes('광안리') ? 0.87 : 0.15),
+    };
+
+    const ranked = service.rank(
+      [twin('minor', '무명 골목 카페'), twin('famous', '광안리 브런치 카페')],
+      { ...busanContext, popularityIndex },
+    );
+
+    expect(ranked[0]!.id).toBe('famous');
+    expect(ranked.find((c) => c.id === 'minor')!.crag.penalties).toContain('naver-unmentioned');
+  });
+
+  it('leaves ranking unchanged when no popularity index is provided (neutral)', () => {
+    const candidate: RawPlaceCandidate = {
+      id: 'c1',
+      name: '광안리 브런치 카페',
+      category: 'cafe',
+      address: '부산 수영구 광안해변로 219',
+      coordinates: { lat: 35.1532, lng: 129.1185 },
+      source: 'pgvector',
+      similarity: 0.86,
+      tags: ['cafe', 'beach', 'romantic'],
+      destinationRegion: 'busan',
+    };
+
+    const ranked = service.rank([candidate], busanContext);
+    expect(ranked[0]!.crag.popularity).toBe(0.5);
+    expect(ranked[0]!.crag.penalties).not.toContain('naver-unmentioned');
+  });
+
+  /**
+   * 예전 구현은 다양성 상한에 걸린 후보를 건너뛴 채 limit 을 채우고 반환해 **버렸다**.
+   * 제주 실측에서 점수 3위 한라산·5위 비자림이 사라지고 더 낮은 점수가 그 자리에 들어왔다.
+   */
+  describe('selectTopDiverse', () => {
+    function candidate(id: string, category: string, confidence: number): CandidatePlace {
+      return {
+        id,
+        name: id,
+        category,
+        address: '서울 어딘가',
+        coordinates: { lat: 37.5, lng: 127 },
+        source: 'pgvector',
+        tags: [],
+        confidence,
+        reason: '',
+        crag: {
+          total: confidence,
+          retrieval: 0,
+          taste: 0,
+          locality: 0,
+          context: 0,
+          availability: 0,
+          popularity: 0,
+          matchedTags: [],
+          penalties: [],
+        },
+      } as CandidatePlace;
+    }
+
+    it('한 카테고리가 쏠려도 고득점 후보를 버리지 않는다', () => {
+      const candidates = [
+        ...Array.from({ length: 8 }, (_, i) => candidate(`a${i}`, 'attraction', 0.9 - i * 0.01)),
+        candidate('c0', 'cafe', 0.5),
+        candidate('r0', 'restaurant', 0.49),
+      ];
+
+      const selected = service.selectTopDiverse(candidates, 6);
+
+      // 점수 상위 4개 관광지가 카페·식당보다 앞에 남아야 한다.
+      expect(selected.slice(0, 4).map((c) => c.id)).toEqual(['a0', 'a1', 'a2', 'a3']);
+      expect(selected).toHaveLength(6);
+    });
+
+    it('식음이 풀을 뒤덮으면 상한만큼 관광지로 바꾼다', () => {
+      // 카카오 조밀 적재의 실제 모양 — 식음이 점수 상위를 쓸어 가고 관광지는 뒤로 밀린다.
+      const candidates = [
+        ...Array.from({ length: 14 }, (_, i) => candidate(`r${i}`, 'restaurant', 0.9 - i * 0.01)),
+        ...Array.from({ length: 16 }, (_, i) => candidate(`a${i}`, 'attraction', 0.7 - i * 0.01)),
+      ];
+
+      const selected = service.selectTopDiverse(candidates, 16);
+
+      expect(selected).toHaveLength(16);
+      // 상한 0.375 → 16칸 중 식음은 6칸까지.
+      expect(selected.filter((c) => c.category === 'restaurant')).toHaveLength(6);
+      // 바꿔 넣는 건 점수 높은 관광지부터고, 머리의 식음 순서는 그대로 둔다.
+      expect(selected.slice(0, 6).map((c) => c.id)).toEqual(['r0', 'r1', 'r2', 'r3', 'r4', 'r5']);
+      expect(selected).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'a0' })]));
+    });
+
+    it('바꿔 넣을 관광지가 없으면 상한을 포기하고 후보를 버리지 않는다', () => {
+      const candidates = Array.from({ length: 8 }, (_, i) =>
+        candidate(`r${i}`, 'restaurant', 0.9 - i * 0.01),
+      );
+
+      const selected = service.selectTopDiverse(candidates, 6);
+
+      expect(selected.map((c) => c.id)).toEqual(['r0', 'r1', 'r2', 'r3', 'r4', 'r5']);
+    });
+
+    it('점수만으로 뽑으면 없을 종류를 최소 보유량만큼 채운다', () => {
+      const candidates = [
+        ...Array.from({ length: 6 }, (_, i) => candidate(`a${i}`, 'attraction', 0.9 - i * 0.01)),
+        candidate('c0', 'cafe', 0.3),
+        candidate('r0', 'restaurant', 0.29),
+      ];
+
+      const selected = service.selectTopDiverse(candidates, 6);
+
+      // 식음 후보가 점수로는 밖이지만 일정에 식사 슬롯이 필요하므로 꼬리 자리를 받는다.
+      const dining = selected.filter((c) => c.category === 'cafe' || c.category === 'restaurant');
+      expect(dining).toHaveLength(2);
+      // 내주는 자리는 꼬리부터 — 최상위는 그대로.
+      expect(selected[0]!.id).toBe('a0');
+      expect(selected).toHaveLength(6);
+    });
+
+    it('식음 하한을 음식점이 다 가져가지 못한다 (카페 자리를 따로 센다)', () => {
+      // 예전엔 식음(restaurant+cafe)을 한 덩어리로 2개만 보장해서, 음식점 2개로 하한이
+      // 채워지면 카페는 영원히 안 들어왔다 — 일정에 카페가 한 번도 없던 원인.
+      const candidates = [
+        ...Array.from({ length: 6 }, (_, i) => candidate(`a${i}`, 'attraction', 0.9 - i * 0.01)),
+        ...Array.from({ length: 4 }, (_, i) => candidate(`r${i}`, 'restaurant', 0.5 - i * 0.01)),
+        candidate('c0', 'cafe', 0.3),
+      ];
+
+      const selected = service.selectTopDiverse(candidates, 8);
+
+      expect(selected.filter((c) => c.category === 'cafe')).toHaveLength(1);
+      expect(selected.filter((c) => c.category === 'restaurant').length).toBeGreaterThanOrEqual(2);
+      expect(selected[0]!.id).toBe('a0');
+    });
+
+    it('일차 수만큼 끼니·카페 자리를 확보한다 (상한보다 하한이 우선)', () => {
+      // 3일 여행이면 끼니만 6번이다. 상한(0.375)이 그보다 작으면 하한을 따른다.
+      const candidates = [
+        ...Array.from({ length: 20 }, (_, i) => candidate(`a${i}`, 'attraction', 0.9 - i * 0.01)),
+        ...Array.from({ length: 8 }, (_, i) => candidate(`r${i}`, 'restaurant', 0.4 - i * 0.01)),
+        ...Array.from({ length: 4 }, (_, i) => candidate(`c${i}`, 'cafe', 0.3 - i * 0.01)),
+      ];
+
+      const selected = service.selectTopDiverse(candidates, 20, {
+        restaurant: 6,
+        cafe: 3,
+        attraction: 2,
+      });
+
+      expect(selected).toHaveLength(20);
+      expect(selected.filter((c) => c.category === 'restaurant')).toHaveLength(6);
+      expect(selected.filter((c) => c.category === 'cafe')).toHaveLength(3);
+      // 하한을 채우느라 상위 점수를 갈아엎지는 않는다.
+      expect(selected[0]!.id).toBe('a0');
+    });
+
+    it('한 종류만 있으면 있는 것만 돌려준다 (억지로 못 채운다)', () => {
+      const candidates = Array.from({ length: 4 }, (_, i) =>
+        candidate(`a${i}`, 'attraction', 0.9 - i * 0.01),
+      );
+      expect(service.selectTopDiverse(candidates, 4).map((c) => c.id)).toEqual([
+        'a0',
+        'a1',
+        'a2',
+        'a3',
+      ]);
+    });
+  });
+
+  /**
+   * 영업시간 항은 감점 전용이다 — "데이터가 있다"에 가점하면 그건 장소 품질이 아니라
+   * 데이터 출처(KTO 관광지)에 붙는 가점이고, 카카오 전용 식당·카페는 영업시간을 영구히 못 얻어
+   * 체계적으로 후순위가 된다.
+   */
+  describe('availability 감점 전용', () => {
+    const withHours = (id: string, openingHours?: string): RawPlaceCandidate => ({
+      id,
+      name: `부산 후보 ${id}`,
+      category: 'attraction',
+      address: '부산 수영구 광안해변로 219',
+      coordinates: { lat: 35.1532, lng: 129.1185 },
+      source: 'pgvector',
+      similarity: 0.52,
+      tags: ['beach'],
+      destinationRegion: 'busan',
+      ...(openingHours ? { openingHours } : {}),
+    });
+
+    /** 2026-08-01 10:00 KST */
+    const visitAt = new Date('2026-08-01T01:00:00.000Z');
+
+    it('영업시간이 있고 열려 있어도 판정 불가 후보와 같은 점수 (출처 가점 없음)', () => {
+      const ranked = service.rank([withHours('open', '09:00-18:00'), withHours('unknown')], {
+        ...busanContext,
+        startAt: visitAt,
+      });
+
+      const open = ranked.find((c) => c.id === 'open')!;
+      const unknown = ranked.find((c) => c.id === 'unknown')!;
+      expect(open.crag.availability).toBe(unknown.crag.availability);
+      expect(open.confidence).toBe(unknown.confidence);
+      expect(open.crag.penalties).not.toContain('closed-at-target-time');
+    });
+
+    it('확인된 닫힘만 감점한다', () => {
+      const ranked = service.rank([withHours('closed', '19:00-23:00'), withHours('unknown')], {
+        ...busanContext,
+        startAt: visitAt,
+      });
+
+      const closed = ranked.find((c) => c.id === 'closed')!;
+      const unknown = ranked.find((c) => c.id === 'unknown')!;
+      expect(closed.crag.availability).toBeLessThan(unknown.crag.availability);
+      expect(closed.crag.penalties).toContain('closed-at-target-time');
+      expect(ranked[0]!.id).toBe('unknown');
+    });
+
+    it('방문 시각이 없으면 영업시간이 있어도 중립 — 후보 95%의 값과 같아야 게이트가 안 흔들린다', () => {
+      const [withData, withoutData] = [
+        service.rank([withHours('open', '09:00-18:00')], busanContext)[0]!,
+        service.rank([withHours('unknown')], busanContext)[0]!,
+      ];
+      expect(withData.crag.availability).toBe(withoutData.crag.availability);
+    });
+  });
+
+  /**
+   * retrieval 가중은 실측 근거로 0.24 → 0.06 으로 내렸다(`retrieval-rank.ts` 주석).
+   * 스윕 노브가 게이트를 흔들지 않는지 — 즉 남은 몫이 비례 배분되는지 — 를 서비스 경로에서 확인한다.
+   */
+  it('CRAG_RETRIEVAL_WEIGHT 를 바꿔도 confidence 수준은 유지된다 (합 1 비례 배분)', () => {
+    const withWeight = (value: string): CragEvaluatorService =>
+      new CragEvaluatorService({
+        get: (key: string) => (key === 'CRAG_RETRIEVAL_WEIGHT' ? value : undefined),
+      } as unknown as ConfigService);
+
+    const candidate: RawPlaceCandidate = {
+      id: 'c1',
+      name: '광안리 브런치 카페',
+      category: 'cafe',
+      address: '부산 수영구 광안해변로 219',
+      coordinates: { lat: 35.1532, lng: 129.1185 },
+      source: 'pgvector',
+      similarity: 0.52,
+      tags: ['cafe', 'beach', 'romantic'],
+      destinationRegion: 'busan',
+    };
+
+    const low = withWeight('0.06').rank([candidate], busanContext)[0]!;
+    const high = withWeight('0.24').rank([candidate], busanContext)[0]!;
+
+    // 가중을 4배 차이로 벌려도 총점은 게이트(0.52) 판정을 뒤집을 만큼 움직이지 않는다.
+    expect(Math.abs(low.confidence - high.confidence)).toBeLessThan(0.05);
+    expect(withWeight('0.06').weights().popularity).toBeGreaterThan(
+      withWeight('0.24').weights().popularity,
+    );
+
+    // 빈 문자열은 `Number('') === 0` 이라 검사 없이 쓰면 **retrieval 항이 조용히 사라진다**.
+    expect(withWeight('').weights().retrieval).toBeCloseTo(DEFAULT_RETRIEVAL_WEIGHT, 10);
+    expect(withWeight('  ').weights().retrieval).toBeCloseTo(DEFAULT_RETRIEVAL_WEIGHT, 10);
+    expect(withWeight('abc').weights().retrieval).toBeCloseTo(DEFAULT_RETRIEVAL_WEIGHT, 10);
+  });
+
+  /**
+   * locality 는 정본 지역 코드로 판정한다. 예전엔 `normalizeDestinationRegion` 이 아는
+   * 4개 목적지(서울·부산·제주·경주) 밖에서는 전 후보가 0.62 로 같아 **가드가 안 돌았다.**
+   */
+  describe('locality 지역 판정', () => {
+    const place = (
+      id: string,
+      address: string,
+      extra: Partial<RawPlaceCandidate> = {},
+    ): RawPlaceCandidate => ({
+      id,
+      name: `후보 ${id}`,
+      category: 'attraction',
+      address,
+      coordinates: { lat: 36.8, lng: 128.6 },
+      source: 'kakao',
+      tags: ['cultural'],
+      ...extra,
+    });
+
+    const context = (destination: string): RetrievalContext => ({
+      userId: 'user-1',
+      destination,
+      trigger: 'manual',
+    });
+
+    it('하드코딩 4곳 밖 목적지에서도 타지역 후보를 감점한다', () => {
+      const ranked = service.rank(
+        [
+          place('busan', '부산 사하구 감내2로 203'),
+          place('yeongju', '경북 영주시 순흥면 소백로 2740'),
+        ],
+        context('영주'),
+      );
+
+      const local = ranked.find((c) => c.id === 'yeongju')!;
+      const other = ranked.find((c) => c.id === 'busan')!;
+      expect(local.crag.locality).toBe(0.92);
+      expect(other.crag.locality).toBe(0.32);
+      expect(other.crag.penalties).toContain('destination-mismatch');
+      expect(ranked[0]!.id).toBe('yeongju');
+    });
+
+    it('시도와 시군구를 교차 비교하지 않는다 — 경기 광주시 ≠ 광주광역시', () => {
+      const ranked = service.rank(
+        [
+          place('gyeonggi', '경기 광주시 경안로 100'),
+          place('gwangju', '광주 동구 금남로 100'),
+        ],
+        context('광주'),
+      );
+
+      expect(ranked.find((c) => c.id === 'gwangju')!.crag.locality).toBe(0.92);
+      expect(ranked.find((c) => c.id === 'gyeonggi')!.crag.locality).toBe(0.32);
+    });
+
+    it('지역 라벨이 없는 후보는 감점이 아니라 중립 — 데이터 없음을 타지역으로 읽으면 안 된다', () => {
+      const ranked = service.rank(
+        [
+          place('unlabeled', ''),
+          place('yeongju', '경북 영주시 순흥면 소백로 2740'),
+        ],
+        context('영주'),
+      );
+
+      const unlabeled = ranked.find((c) => c.id === 'unlabeled')!;
+      expect(unlabeled.crag.locality).toBe(0.62);
+      expect(unlabeled.crag.penalties).not.toContain('destination-mismatch');
+    });
+
+    it('한 후보도 안 맞으면 가드를 끈다 — 일률 감점은 순위를 못 바꾸면서 confidence 레벨만 흔든다', () => {
+      // '발리' 같은 자유 입력도 `destinationRegionFilter` 는 시군구 코드를 만들어 낸다.
+      const ranked = service.rank(
+        [
+          place('busan', '부산 사하구 감내2로 203'),
+          place('seoul', '서울 종로구 사직로 161'),
+        ],
+        context('발리'),
+      );
+
+      for (const candidate of ranked) {
+        expect(candidate.crag.locality).toBe(0.62);
+        expect(candidate.crag.penalties).not.toContain('destination-mismatch');
+      }
+    });
+  });
+
+  describe('앵커 목적지의 locality — 거리 기반', () => {
+    const anchored = (radiusM: number): RetrievalContext => ({
+      userId: 'u1',
+      destination: '광안리',
+      regionFilter: { sido: '부산', sigungu: '수영' },
+      anchor: {
+        coordinates: { lat: 35.1532, lng: 129.119 },
+        label: '광안리해수욕장',
+        region: { sido: '부산', sigungu: '수영' },
+        radiusM,
+      },
+    });
+    const at = (id: string, lat: number, lng: number): RawPlaceCandidate => ({
+      id,
+      name: id,
+      category: 'attraction',
+      address: '부산 수영구',
+      coordinates: { lat, lng },
+      source: 'pgvector',
+      similarity: 0.5,
+      tags: ['city'],
+    });
+
+    it('앵커에 가까울수록 높다 — 지역 코드로는 반경 안이 전부 같은 시도라 못 가른다', () => {
+      const ranked = service.rank(
+        [at('far', 35.1532 + 1.8 / 111, 129.119), at('near', 35.1532, 129.119)],
+        anchored(2000),
+      );
+      const near = ranked.find((c) => c.id === 'near')!;
+      const far = ranked.find((c) => c.id === 'far')!;
+      expect(near.crag.locality).toBeGreaterThan(far.crag.locality);
+      expect(near.crag.locality).toBeCloseTo(0.95, 2);
+    });
+
+    it('반경으로 정규화한다 — 고정 밴드면 2km 앵커 안에서 변별이 안 된다', () => {
+      // 같은 1km 라도 2km 앵커에선 경계 근처, 10km 앵커에선 중심 근처여야 한다.
+      const point = at('p', 35.1532 + 1 / 111, 129.119);
+      const tight = service.rank([point], anchored(2000))[0]!;
+      const wide = service.rank([point], anchored(10000))[0]!;
+      expect(wide.crag.locality).toBeGreaterThan(tight.crag.locality);
+    });
+
+    it('반경 밖(시도 전역 덧댐)은 하한으로 눌러 가까운 후보 뒤에 세운다', () => {
+      const ranked = service.rank([at('outside', 35.1532 + 20 / 111, 129.119)], anchored(2000));
+      // 순위만 낮추고 탈락시키지는 않는다 — 인지도 감점과 같은 원칙.
+      expect(ranked[0]!.crag.locality).toBeGreaterThan(0);
+      expect(ranked[0]!.crag.locality).toBeLessThanOrEqual(0.3);
+    });
+  });
+
+  describe('인지도 판정 가능성', () => {
+    const index = (mentionedNames: string[]) => ({
+      docCount: 600,
+      mentions: (name: string) => (mentionedNames.includes(name) ? 3 : 0),
+      score: (name: string) => (mentionedNames.includes(name) ? 0.9 : 0.15),
+    });
+    // 이름은 자리수를 맞춰야 한다 — '장소9' 가 '장소99' 에 포함돼 근접 중복으로 접힌다.
+    const nameOf = (i: number) => `장소${String(i).padStart(3, '0')}`;
+    const pool = (count: number): RawPlaceCandidate[] =>
+      Array.from({ length: count }, (_, i) => ({
+        id: `p${i}`,
+        name: nameOf(i),
+        category: 'attraction',
+        address: '대구 중구',
+        coordinates: { lat: 35.87 + i / 200, lng: 128.6 },
+        source: 'pgvector' as const,
+        similarity: 0.5,
+        tags: ['city'],
+      }));
+
+    it('코퍼스가 그 지역을 못 담으면 전 후보 중립 — 언급 0 은 마이너가 아니라 정보 없음', () => {
+      // 대구 실측이 400건 중 5건(1.3%). 그 상태의 감점은 신호가 아니라 노이즈다.
+      const ranked = service.rank(pool(100), {
+        userId: 'u1',
+        destination: '대구',
+        popularityIndex: index([nameOf(0)]) as never,
+      });
+      for (const candidate of ranked) {
+        expect(candidate.crag.popularity).toBe(0.5);
+        expect(candidate.crag.penalties).not.toContain('naver-unmentioned');
+      }
+    });
+
+    it('코퍼스가 담아냈으면 감점을 그대로 살린다 — 항을 끄는 게 목적이 아니다', () => {
+      const mentioned = Array.from({ length: 20 }, (_, i) => nameOf(i));
+      const ranked = service.rank(pool(100), {
+        userId: 'u1',
+        destination: '속초',
+        popularityIndex: index(mentioned) as never,
+      });
+      expect(ranked.find((c) => c.name === nameOf(0))!.crag.popularity).toBe(0.9);
+      expect(ranked.find((c) => c.name === nameOf(99))!.crag.popularity).toBe(0.15);
+    });
+  });
+
+  describe('취향 판정 가능성 (폴백 태그뿐이면 중립)', () => {
+    const ctx = (): RetrievalContext => ({
+      userId: 'u1',
+      destination: '속초',
+      tasteTags: { food: ['seafood'], mood: ['adventure'], environment: ['mountain', 'nature'], confidence: 0.85 },
+    });
+    const at = (id: string, name: string, tags: string[]): RawPlaceCandidate => ({
+      id, name, category: 'attraction', address: '강원특별자치도 속초시',
+      coordinates: { lat: 38.2 + id.length / 1000, lng: 128.6 },
+      source: 'pgvector', similarity: 0.5, tags,
+    });
+
+    it('사전이 못 읽은 후보(폴백 태그뿐)는 감점하지 않는다', () => {
+      // 실측: 신흥사·영금정이 인지도 1.00 인데 태그 매칭 0 → taste 0.54 로 17~19위까지 밀렸다.
+      // 사전의 빈틈은 "취향에 안 맞다"가 아니라 "모른다"다.
+      const [fallbackOnly, matched] = service.rank(
+        [at('a', '신흥사', ['cultural']), at('b', '설악산', ['mountain', 'nature'])],
+        ctx(),
+      );
+      const only = [fallbackOnly, matched].find((c) => c!.name === '신흥사')!;
+      expect(only.crag.taste).toBeCloseTo(0.56, 2);
+    });
+
+    it('실질 태그가 있으면 그대로 판정한다 — 항을 끄는 게 목적이 아니다', () => {
+      const ranked = service.rank([at('c', '설악산', ['mountain', 'nature'])], ctx());
+      // 4개 중 2개 매칭 → 중립(0.56)보다 확실히 높아야 한다.
+      expect(ranked[0]!.crag.taste).toBeGreaterThan(0.7);
+    });
+  });
+});

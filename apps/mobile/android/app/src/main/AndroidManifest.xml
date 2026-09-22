@@ -1,0 +1,78 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 여행 진행 화면이 열려 있을 때 현재 위치와 경로 이탈을 확인한다. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Android 13+ 푸시 알림 런타임 권한 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- WorkManager/Notifee의 선택적 장기 작업 서비스는 사용하지 않는다. -->
+    <uses-permission
+        android:name="android.permission.FOREGROUND_SERVICE"
+        tools:node="remove" />
+    <!--
+      사진 업로드(<input type=file>)는 권한 선언이 필요 없다.
+      갤러리 선택은 react-native-webview 가 SAF(ACTION_GET_CONTENT)로 열어 선택한 파일만 URI 로 넘겨받으므로
+      READ_MEDIA_IMAGES/READ_EXTERNAL_STORAGE 가 없어도 동작한다.
+      CAMERA 는 의도적으로 선언하지 않는다 — 선언해 두면 RNCWebViewModuleImpl.needsCameraPermission() 이
+      "선언됐는데 미승인" 을 감지해 촬영 항목을 아예 빼버린다. 미선언 상태로 두면 시스템 카메라 앱에 위임돼
+      별도 권한 없이 촬영이 된다.
+    -->
+
+    <!-- Android 11+ 패키지 가시성: 선언이 없으면 파일 선택 시트에서 카메라 앱 항목이 사라진다 -->
+    <queries>
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE" />
+        </intent>
+    </queries>
+
+    <application
+      android:name=".MainApplication"
+      android:label="@string/app_name"
+      android:icon="@mipmap/ic_tripick"
+      android:roundIcon="@mipmap/ic_tripick_round"
+      android:allowBackup="false"
+      android:theme="@style/AppTheme"
+      android:usesCleartextTraffic="${usesCleartextTraffic}"
+      android:supportsRtl="true">
+      <service
+          android:name="app.notifee.core.ForegroundService"
+          tools:node="remove" />
+      <activity
+        android:name=".MainActivity"
+        android:label="@string/app_name"
+        android:configChanges="keyboard|keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+        android:launchMode="singleTask"
+        android:windowSoftInputMode="adjustResize"
+        android:exported="true">
+        <intent-filter>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent-filter>
+        <!-- 카카오 OAuth 완료 후 시스템 브라우저에서 앱 WebView 로 복귀 -->
+        <intent-filter android:autoVerify="true">
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.DEFAULT" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data
+                android:scheme="https"
+                android:host="tripick.place"
+                android:pathPrefix="/auth/kakao/callback" />
+        </intent-filter>
+        <!--
+          지원 링크 열기가 사용자 설정으로 꺼져 있어도 OAuth 완료 후 앱으로 복귀할 수 있는
+          Android 전용 fallback. 서버는 package 가 고정된 intent:// URL 로만 이 스킴을 연다.
+        -->
+        <intent-filter>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.DEFAULT" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data
+                android:scheme="tripick"
+                android:host="auth"
+                android:pathPrefix="/kakao/callback" />
+        </intent-filter>
+      </activity>
+    </application>
+</manifest>

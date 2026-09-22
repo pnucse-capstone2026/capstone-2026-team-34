@@ -1,0 +1,131 @@
+export interface KakaoProfile {
+  id: string;
+  nickname: string;
+  profileImageUrl?: string;
+  email?: string;
+}
+
+export interface JwtPayload {
+  sub: string;
+  /** Stable refresh family root; required for access-token authorization. */
+  sid?: string;
+  email?: string;
+  iat?: number;
+  exp?: number;
+}
+
+export interface AuthTokens {
+  accessToken: string;
+  refreshToken: string;
+}
+
+export interface SessionUserDto {
+  id: string;
+  nickname: string;
+  /** 친구 추가·멘션용 고유 핸들 (예: "koty"). 가입 경로와 무관하게 항상 존재. */
+  handle?: string;
+  profileImageUrl?: string;
+  email?: string;
+  emailVerified: boolean;
+  hasPassword: boolean;
+}
+
+export interface LoginResponseDto {
+  tokens: AuthTokens;
+  user: SessionUserDto;
+}
+
+export interface KakaoAuthStatusDto {
+  ready: boolean;
+  missingKeys?: string[];
+  /**
+   * 로그인을 시작할 절대 URL. 상대경로(`/api/v1/auth/kakao`)로 시작하면 웹 프록시 오리진에서
+   * 출발하는데 카카오는 `KAKAO_CALLBACK_URL`(API 오리진)로 돌려보내, 시작 때 심은 CSRF state
+   * 쿠키가 콜백에 실리지 않는다. 두 다리를 같은 오리진에 두려고 서버가 계산해서 내려준다.
+   */
+  startUrl?: string;
+}
+
+/**
+ * 카카오 교환 결과.
+ *
+ * 기존 회원이면 바로 세션이 나오지만, **처음 오는 사람은 계정을 만들기 전에 약관 동의를
+ * 받아야 한다**(이용약관 제5조: 약관에 동의해야 회원가입이 성립). 그래서 이 단계에서는
+ * 계정을 만들지 않고 동의 화면으로 넘길 코드만 돌려준다 — 동의하지 않고 떠나면 계정은
+ * 아예 생기지 않는다.
+ */
+export type KakaoExchangeResultDto =
+  | { status: 'ok'; session: LoginResponseDto }
+  | {
+      status: 'consent_required';
+      /** 동의 후 `POST /auth/kakao/signup` 에 되돌려줄 1회용 코드. */
+      consentCode: string;
+      /** 동의 화면에 "OO 님으로 가입" 을 보여주기 위한 카카오 프로필 요약. */
+      nickname?: string;
+      email?: string;
+    };
+
+/** 카카오 콜백이 URL 로 넘긴 1회용 교환 코드 → 실제 세션. */
+export interface KakaoExchangeDto {
+  code: string;
+  /**
+   * 로그인을 **시작한 브라우저**만 아는 비밀. 시작 요청(`/auth/kakao?bind=…`)에 실어 보내고
+   * 교환에서 다시 제시해, 코드가 그 브라우저에 묶이게 한다.
+   *
+   * 없으면 교환 코드는 URL 에 실린 그 자체로 세션이 된다 — 공격자가 자기 카카오 로그인을
+   * 끝내 얻은 코드를 피해자에게 링크(또는 Android 딥링크)로 던지면 피해자가 조용히 **공격자
+   * 계정으로** 로그인되고, 이후 만드는 여행·사진이 전부 공격자 계정에 쌓인다. 시작 단계의
+   * `state` 는 카카오 왕복만 보호해서 이 마지막 홉을 못 막는다.
+   */
+  bind: string;
+}
+
+export interface EmailSignupDto {
+  email: string;
+  password: string;
+  nickname: string;
+}
+
+export interface EmailLoginDto {
+  email: string;
+  password: string;
+}
+
+export interface VerifyEmailDto {
+  token: string;
+}
+
+export interface ResendVerificationDto {
+  email: string;
+}
+
+export interface RequestPasswordResetDto {
+  email: string;
+}
+
+export interface ResetPasswordDto {
+  token: string;
+  password: string;
+}
+
+/**
+ * 로그인한 상태에서 비밀번호 변경. 메일 왕복이 없는 대신 **현재 비밀번호**로 본인을 다시
+ * 확인한다 — 세션만으로 통과시키면 잠깐 열린 기기·탈취된 access token 이 그대로 계정
+ * 인수(비밀번호 교체 → 다른 세션 폐기)로 이어진다.
+ *
+ * 비밀번호가 아직 없는 계정(카카오 단독 가입)은 이 경로를 쓰지 않는다. 대조할 현재
+ * 비밀번호가 없어 확인이 세션 하나로 줄어들기 때문 — 그쪽은 이메일 소유를 다시 증명하는
+ * 재설정 플로우(`/auth/forgot-password`)로 보낸다.
+ */
+export interface ChangePasswordDto {
+  currentPassword: string;
+  newPassword: string;
+}
+
+/** /auth/signup, /auth/verify-email 등 비-로그인 응답 — message + email 정도만 노출 */
+export interface AuthOpResultDto {
+  ok: true;
+  message: string;
+  /** 디버그·UI 안내용 — 인증 메일을 보낸 주소 등 */
+  email?: string;
+}
